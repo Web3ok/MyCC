@@ -152,8 +152,6 @@ load_config() {
             val=$(echo "$val" | sed 's/^["'"'"']//; s/["'"'"']$//')
             case "$key" in
                 SESSION_KEY)       [[ -z "$SESSION_KEY" ]] && SESSION_KEY="$val" ;;
-                COOKIE_HEADER)     [[ -z "${COOKIE_HEADER:-}" ]] && COOKIE_HEADER="$val" ;;
-                USER_AGENT)        [[ -z "${USER_AGENT:-}" ]] && USER_AGENT="$val" ;;
                 ORG_ID)            [[ -z "$ORG_ID" ]] && ORG_ID="$val" ;;
                 RESUME_MODE)       RESUME_MODE="$val" ;;
                 RESUME_PROMPT)     RESUME_PROMPT="$val" ;;
@@ -324,82 +322,79 @@ parse_reset_time_from_msg() {
 }
 
 # ============================================
-# Detailed Mode: Claude.ai API
+# Detailed Mode: Local cache + browser refresh
 # ============================================
 
-api_curl() {
-    local url="$1"
-    # If full cookie header is available, use it; otherwise build from individual values
-    local cookie_str="${COOKIE_HEADER:-}"
-    if [[ -z "$cookie_str" ]]; then
-        cookie_str="sessionKey=${SESSION_KEY}"
-        [[ -n "${CF_CLEARANCE:-}" ]] && cookie_str+="; cf_clearance=${CF_CLEARANCE}"
+USAGE_CACHE="$HOME/.mycc-usage.json"
+
+# Refresh usage data: open browser to download fresh JSON
+refresh_usage() {
+    if [[ -z "$ORG_ID" ]]; then
+        die "No ORG_ID configured. Run 'mycc --setup' first."
     fi
-    # Use user's actual User-Agent if captured, otherwise default
-    local ua="${USER_AGENT:-Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36}"
-    curl -s -w "\n%{http_code}" \
-        --max-time 15 \
-        -H "accept: */*" \
-        -H "content-type: application/json" \
-        -H "user-agent: ${ua}" \
-        -H "origin: https://claude.ai" \
-        -H "referer: https://claude.ai/settings/usage" \
-        -H "sec-fetch-dest: empty" \
-        -H "sec-fetch-mode: cors" \
-        -H "sec-fetch-site: same-origin" \
-        -H "Cookie: ${cookie_str}" \
-        "$url"
+    local js_url="javascript:void(fetch('/api/organizations/${ORG_ID}/usage').then(r=>r.json()).then(d=>{var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(d)]));a.download='mycc-usage.json';a.click()}))"
+    info "Opening browser to download fresh usage data..."
+    info "If it doesn't download automatically, run this in the browser console:"
+    echo ""
+    echo "  fetch('/api/organizations/${ORG_ID}/usage').then(r=>r.json()).then(d=>{var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(d)]));a.download='mycc-usage.json';a.click()})"
+    echo ""
+    open "https://claude.ai/settings/usage" 2>/dev/null || true
 }
 
-fetch_org_id() {
-    local response http_code body
-    response=$(api_curl "https://claude.ai/api/organizations")
-    http_code=$(echo "$response" | tail -1)
-    body=$(echo "$response" | sed '$d')
-
-    if [[ "$http_code" == "403" ]]; then
-        die "Cloudflare blocked the request (HTTP 403). Run 'mycc --setup' and make sure to provide cf_clearance cookie."
-    elif [[ "$http_code" != "200" ]]; then
-        die "Failed to fetch organizations (HTTP $http_code). Check your sessionKey."
+# Import usage JSON from Downloads folder or a given path
+import_usage() {
+    local src="${1:-$HOME/Downloads/mycc-usage.json}"
+    if [[ ! -f "$src" ]]; then
+        die "File not found: $src"
     fi
-
-    if echo "$body" | grep -q '<!DOCTYPE'; then
-        die "Received HTML instead of JSON. Cloudflare may be blocking the request."
+    # Validate JSON
+    if ! jq -e '.five_hour' "$src" &>/dev/null; then
+        die "Invalid usage JSON: $src"
     fi
-
-    ORG_ID=$(echo "$body" | jq -r '.[0].uuid // empty')
-    [[ -z "$ORG_ID" ]] && die "Could not extract organization ID from API response."
-    info "Discovered org: $(echo "$body" | jq -r '.[0].name // "unknown"') ($ORG_ID)"
+    cp "$src" "$USAGE_CACHE"
+    info "Imported usage data to $USAGE_CACHE"
+    # Clean up source if it's in Downloads
+    if [[ "$src" == "$HOME/Downloads/mycc-usage.json" ]]; then
+        rm -f "$src"
+    fi
 }
 
 check_detailed() {
-    [[ -z "$ORG_ID" ]] && fetch_org_id
-
-    local response http_code body
-    response=$(api_curl "https://claude.ai/api/organizations/${ORG_ID}/usage")
-    http_code=$(echo "$response" | tail -1)
-    body=$(echo "$response" | sed '$d')
-
-    case "$http_code" in
-        200) ;;
-        401) die "Session expired (HTTP 401). Run: mycc --setup" ;;
-        403) die "Access denied (HTTP 403). Cloudflare may be blocking. Try again later." ;;
-        429) warn "API rate limited. Retrying in 60s..."; sleep 60; check_detailed; return ;;
-        *)   die "API request failed (HTTP $http_code)" ;;
-    esac
-
-    if echo "$body" | grep -q '<!DOCTYPE'; then
-        die "Received HTML instead of JSON. Cloudflare is blocking the request."
+    # Auto-import from Downloads if cache is missing or stale
+    if [[ -f "$HOME/Downloads/mycc-usage.json" ]]; then
+        import_usage "$HOME/Downloads/mycc-usage.json" 2>/dev/null || true
     fi
 
-    # Parse each limit dimension
-    FIVE_HOUR_PCT=$(echo "$body" | jq -r 'if .five_hour.utilization then (.five_hour.utilization * 100 | floor) else 0 end')
+    if [[ ! -f "$USAGE_CACHE" ]]; then
+        die "No usage data. Run in browser console at claude.ai:\n\n  fetch('/api/organizations/${ORG_ID}/usage').then(r=>r.json()).then(d=>{var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(d)]));a.download='mycc-usage.json';a.click()})\n\nThen run: mycc -d --check"
+    fi
+
+    local body
+    body=$(cat "$USAGE_CACHE")
+
+    # Show cache age
+    local cache_ts
+    if [[ "$IS_GNU_DATE" == "false" ]]; then
+        cache_ts=$(stat -f '%m' "$USAGE_CACHE")
+    else
+        cache_ts=$(stat -c '%Y' "$USAGE_CACHE")
+    fi
+    local now_ts
+    now_ts=$(date +%s)
+    local age=$(( now_ts - cache_ts ))
+    local age_min=$(( age / 60 ))
+    if (( age_min > 0 )); then
+        info "Usage data is ${age_min}m old (from cache)"
+    fi
+
+    # Parse — utilization is already 0-100 integer from the API
+    FIVE_HOUR_PCT=$(echo "$body" | jq -r '.five_hour.utilization // 0')
     FIVE_HOUR_RESETS=$(echo "$body" | jq -r '.five_hour.resets_at // empty')
-    SEVEN_DAY_PCT=$(echo "$body" | jq -r 'if .seven_day.utilization then (.seven_day.utilization * 100 | floor) else 0 end')
+    SEVEN_DAY_PCT=$(echo "$body" | jq -r '.seven_day.utilization // 0')
     SEVEN_DAY_RESETS=$(echo "$body" | jq -r '.seven_day.resets_at // empty')
-    OPUS_PCT=$(echo "$body" | jq -r 'if .seven_day_opus.utilization then (.seven_day_opus.utilization * 100 | floor) else 0 end')
+    OPUS_PCT=$(echo "$body" | jq -r '.seven_day_opus.utilization // 0')
     OPUS_RESETS=$(echo "$body" | jq -r '.seven_day_opus.resets_at // empty')
-    SONNET_PCT=$(echo "$body" | jq -r 'if .seven_day_sonnet.utilization then (.seven_day_sonnet.utilization * 100 | floor) else 0 end')
+    SONNET_PCT=$(echo "$body" | jq -r '.seven_day_sonnet.utilization // 0')
     SONNET_RESETS=$(echo "$body" | jq -r '.seven_day_sonnet.resets_at // empty')
 
     # Determine which limit is hit (if any)
@@ -602,7 +597,7 @@ countdown_loop() {
         fi
 
         # Periodic API refresh in detailed mode
-        if [[ "$MODE" == "detailed" && -n "$SESSION_KEY" ]]; then
+        if [[ "$MODE" == "detailed" && -n "$ORG_ID" ]]; then
             local since_refresh=$(( now_ts - last_refresh ))
             if (( since_refresh >= REFRESH_INTERVAL )); then
                 check_detailed 2>/dev/null || true
@@ -663,69 +658,23 @@ setup_wizard() {
     echo -e "${C_BOLD}MyCC Setup${C_RESET}"
     echo "====================="
     echo ""
-    echo "To use detailed mode, you need to copy request headers from your browser."
+    echo "Detailed mode reads usage data from a local cache file."
+    echo "To get the data, run this in your browser console at claude.ai:"
     echo ""
-    echo "Steps:"
-    echo "  1. Open https://claude.ai/settings/usage in your browser (must be logged in)"
-    echo "  2. Open DevTools: Cmd+Option+I (Mac) / F12 (Windows)"
-    echo "  3. Go to the Network tab, filter by 'usage'"
-    echo "  4. Refresh the page — find the 'usage' request"
-    echo "  5. Right-click the request > Copy > Copy as cURL"
-    echo "  6. Paste below (we'll extract Cookie and User-Agent)"
-    echo ""
-    echo "Paste the cURL command (then press Enter twice when done):"
 
-    local curl_cmd=""
-    local line
-    while IFS= read -r line; do
-        [[ -z "$line" ]] && break
-        curl_cmd+="$line "
-    done
+    # Ask for orgId
+    local oid
+    read -rp "Organization ID (from browser cookies 'lastActiveOrg', or press Enter to skip): " oid
+    ORG_ID="${oid:-${ORG_ID:-}}"
 
-    if [[ -n "$curl_cmd" ]]; then
-        # Extract Cookie header
-        local extracted_cookie
-        extracted_cookie=$(echo "$curl_cmd" | grep -oE "Cookie: [^'\"]*" | head -1 | sed 's/^Cookie: //')
-        if [[ -z "$extracted_cookie" ]]; then
-            extracted_cookie=$(echo "$curl_cmd" | grep -oE "'Cookie: [^']*'" | head -1 | sed "s/^'Cookie: //; s/'$//")
-        fi
-        # Extract User-Agent header
-        local extracted_ua
-        extracted_ua=$(echo "$curl_cmd" | grep -oE "user-agent: [^'\"]*" | head -1 | sed 's/^user-agent: //')
-        if [[ -z "$extracted_ua" ]]; then
-            extracted_ua=$(echo "$curl_cmd" | grep -ioE "'user-agent: [^']*'" | head -1 | sed "s/^'[Uu]ser-[Aa]gent: //; s/'$//")
-        fi
-
-        if [[ -n "$extracted_cookie" ]]; then
-            COOKIE_HEADER="$extracted_cookie"
-            # Also extract sessionKey from the cookie string for config
-            SESSION_KEY=$(echo "$extracted_cookie" | grep -oE 'sessionKey=[^;]+' | head -1 | sed 's/sessionKey=//')
-            info "Extracted cookies (${#extracted_cookie} chars)"
-        else
-            warn "Could not extract Cookie header from pasted cURL."
-            echo ""
-            echo "Fallback: paste your sessionKey manually."
-            local sk
-            read -rp "sessionKey (or press Enter to skip): " sk
-            SESSION_KEY="${sk:-}"
-        fi
-
-        if [[ -n "$extracted_ua" ]]; then
-            USER_AGENT="$extracted_ua"
-            info "Extracted User-Agent"
-        fi
-    else
+    if [[ -n "$ORG_ID" ]]; then
         echo ""
-        echo "No cURL pasted. Fallback: paste your sessionKey manually."
-        local sk
-        read -rp "sessionKey (or press Enter to skip): " sk
-        SESSION_KEY="${sk:-}"
-    fi
-
-    if [[ -n "$SESSION_KEY" ]]; then
-        detect_os
-        echo "Fetching organization ID..."
-        fetch_org_id
+        echo -e "${C_BOLD}Run this in your browser console (F12 > Console) at claude.ai:${C_RESET}"
+        echo ""
+        echo "  fetch('/api/organizations/${ORG_ID}/usage').then(r=>r.json()).then(d=>{var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(d)]));a.download='mycc-usage.json';a.click()})"
+        echo ""
+        echo "This downloads mycc-usage.json. MyCC will auto-import it."
+        echo ""
     fi
 
     local rm
@@ -737,7 +686,7 @@ setup_wizard() {
     RESUME_PROMPT="${rp:-continue}"
 
     local ri
-    read -rp "API refresh interval in seconds (default: 120): " ri
+    read -rp "Refresh interval in seconds for compact mode (default: 120): " ri
     REFRESH_INTERVAL="${ri:-120}"
 
     # Write config
@@ -745,9 +694,6 @@ setup_wizard() {
 # mycc configuration
 # Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-SESSION_KEY=${SESSION_KEY}
-COOKIE_HEADER=${COOKIE_HEADER:-}
-USER_AGENT=${USER_AGENT:-}
 ORG_ID=${ORG_ID}
 RESUME_MODE=${RESUME_MODE}
 RESUME_PROMPT=${RESUME_PROMPT}
@@ -758,8 +704,9 @@ CONFEOF
     chmod 600 "$CONF_FILE"
     echo ""
     info "Config saved to $CONF_FILE"
-    if [[ -n "$SESSION_KEY" ]]; then
-        echo "Test with: mycc -d --check"
+    echo ""
+    if [[ -n "$ORG_ID" ]]; then
+        echo "Next: download usage data from browser, then run: mycc -d --check"
     else
         echo "Test with: mycc --check"
     fi
@@ -910,7 +857,7 @@ compact_loop() {
                 run_test_mode "$TEST_MODE_SECS"
                 TEST_MODE_SECS=""
                 last_check=$now_ts
-            elif [[ "$MODE" == "detailed" && -n "$SESSION_KEY" ]]; then
+            elif [[ "$MODE" == "detailed" && -n "$ORG_ID" ]]; then
                 check_detailed 2>/dev/null || true
                 last_check=$now_ts
             elif [[ "$MODE" == "basic" ]]; then
@@ -992,13 +939,12 @@ main() {
 
     # Validate mode requirements
     if [[ "$MODE" == "detailed" && -z "$TEST_MODE_SECS" ]]; then
-        if [[ -z "$SESSION_KEY" ]]; then
-            warn "No sessionKey configured. Falling back to basic mode."
+        if [[ -z "$ORG_ID" ]]; then
+            warn "No ORG_ID configured. Falling back to basic mode."
             warn "Run 'mycc --setup' to configure detailed mode."
             MODE="basic"
         else
             command -v jq &>/dev/null || die "Detailed mode requires jq. Install: brew install jq"
-            command -v curl &>/dev/null || die "Detailed mode requires curl."
         fi
     fi
 
