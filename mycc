@@ -398,9 +398,33 @@ import_usage() {
 }
 
 check_detailed() {
-    # Auto-import from Downloads if cache is missing or stale
-    if [[ -f "$HOME/Downloads/mycc-usage.json" ]]; then
-        import_usage "$HOME/Downloads/mycc-usage.json" 2>/dev/null || true
+    local dl_file="$HOME/Downloads/mycc-usage.json"
+
+    # Auto-import from Downloads if:
+    # - cache doesn't exist, OR
+    # - Downloads file is newer than cache
+    if [[ -f "$dl_file" ]]; then
+        local should_import=false
+        if [[ ! -f "$USAGE_CACHE" ]]; then
+            should_import=true
+        else
+            # Compare modification times
+            local cache_ts dl_ts
+            if [[ "$IS_GNU_DATE" == "false" ]]; then
+                cache_ts=$(stat -f '%m' "$USAGE_CACHE")
+                dl_ts=$(stat -f '%m' "$dl_file")
+            else
+                cache_ts=$(stat -c '%Y' "$USAGE_CACHE")
+                dl_ts=$(stat -c '%Y' "$dl_file")
+            fi
+            if (( dl_ts > cache_ts )); then
+                should_import=true
+            fi
+        fi
+
+        if [[ "$should_import" == "true" ]]; then
+            import_usage "$dl_file" 2>/dev/null || true
+        fi
     fi
 
     if [[ ! -f "$USAGE_CACHE" ]]; then
