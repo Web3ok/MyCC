@@ -152,6 +152,7 @@ load_config() {
             val=$(echo "$val" | sed 's/^["'"'"']//; s/["'"'"']$//')
             case "$key" in
                 SESSION_KEY)       [[ -z "$SESSION_KEY" ]] && SESSION_KEY="$val" ;;
+                CF_CLEARANCE)      [[ -z "${CF_CLEARANCE:-}" ]] && CF_CLEARANCE="$val" ;;
                 ORG_ID)            [[ -z "$ORG_ID" ]] && ORG_ID="$val" ;;
                 RESUME_MODE)       RESUME_MODE="$val" ;;
                 RESUME_PROMPT)     RESUME_PROMPT="$val" ;;
@@ -327,19 +328,22 @@ parse_reset_time_from_msg() {
 
 api_curl() {
     local url="$1"
+    local cookie_str="sessionKey=${SESSION_KEY}"
+    [[ -n "${CF_CLEARANCE:-}" ]] && cookie_str+="; cf_clearance=${CF_CLEARANCE}"
     curl -s -w "\n%{http_code}" \
         --max-time 15 \
         -H "accept: */*" \
         -H "content-type: application/json" \
-        -H "anthropic-client-platform: web_claude_ai" \
-        -H "anthropic-client-version: 1.0.0" \
-        -H "user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
+        -H "user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36" \
+        -H "sec-ch-ua: \"Chromium\";v=\"132\", \"Google Chrome\";v=\"132\", \"Not-A.Brand\";v=\"99\"" \
+        -H "sec-ch-ua-mobile: ?0" \
+        -H "sec-ch-ua-platform: \"macOS\"" \
         -H "origin: https://claude.ai" \
         -H "referer: https://claude.ai/settings/usage" \
         -H "sec-fetch-dest: empty" \
         -H "sec-fetch-mode: cors" \
         -H "sec-fetch-site: same-origin" \
-        -H "Cookie: sessionKey=${SESSION_KEY}" \
+        -H "Cookie: ${cookie_str}" \
         "$url"
 }
 
@@ -349,7 +353,9 @@ fetch_org_id() {
     http_code=$(echo "$response" | tail -1)
     body=$(echo "$response" | sed '$d')
 
-    if [[ "$http_code" != "200" ]]; then
+    if [[ "$http_code" == "403" ]]; then
+        die "Cloudflare blocked the request (HTTP 403). Run 'mycc --setup' and make sure to provide cf_clearance cookie."
+    elif [[ "$http_code" != "200" ]]; then
         die "Failed to fetch organizations (HTTP $http_code). Check your sessionKey."
     fi
 
@@ -653,18 +659,23 @@ setup_wizard() {
     echo -e "${C_BOLD}MyCC Setup${C_RESET}"
     echo "====================="
     echo ""
-    echo "To use detailed mode, you need your Claude.ai session key."
+    echo "To use detailed mode, you need cookies from your Claude.ai browser session."
     echo ""
-    echo "Steps to get it:"
+    echo "Steps to get them:"
     echo "  1. Open https://claude.ai in your browser, make sure you're logged in"
     echo "  2. Open DevTools (Cmd+Option+I) > Application tab"
-    echo "  3. Under Cookies > https://claude.ai, find 'sessionKey'"
-    echo "  4. Copy its Value"
+    echo "  3. Under Cookies > https://claude.ai, copy these two values:"
+    echo "     - sessionKey"
+    echo "     - cf_clearance  (needed to bypass Cloudflare)"
     echo ""
 
     local sk
-    read -rp "Session Key (or press Enter to skip): " sk
+    read -rp "sessionKey (or press Enter to skip): " sk
     SESSION_KEY="${sk:-}"
+
+    local cfc
+    read -rp "cf_clearance (or press Enter to skip): " cfc
+    CF_CLEARANCE="${cfc:-}"
 
     if [[ -n "$SESSION_KEY" ]]; then
         detect_os
@@ -690,6 +701,7 @@ setup_wizard() {
 # Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 SESSION_KEY=${SESSION_KEY}
+CF_CLEARANCE=${CF_CLEARANCE}
 ORG_ID=${ORG_ID}
 RESUME_MODE=${RESUME_MODE}
 RESUME_PROMPT=${RESUME_PROMPT}
