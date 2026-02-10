@@ -19,6 +19,7 @@ MyCC solves all three: **monitor → countdown → auto-resume**.
 ## Features
 
 - **Real-time quota monitoring** — See 5-hour, 7-day, and per-model usage at a glance
+- **One-click refresh** — `mycc --refresh` opens a browser page to fetch latest data
 - **Precise countdown** — Know exactly when your limit resets, down to the second
 - **Auto-resume** — Automatically continues your Claude Code session when the limit lifts
 - **tmux integration** — `--launch` starts Claude Code with a live status bar at the bottom
@@ -162,9 +163,17 @@ Usage data cache: `~/.mycc-usage.json` (auto-imported from `~/Downloads/mycc-usa
 
 ### How to refresh usage data
 
-1. **Browser console**: Run the JS snippet from `mycc --bookmarklet` on any claude.ai page
-2. **Bookmarklet**: Save the snippet as a browser bookmark for one-click refresh
-3. The downloaded `mycc-usage.json` is auto-imported on next `mycc -d` run
+**Option 1: One-click refresh (recommended)**
+```bash
+mycc --refresh
+```
+This opens a local HTML page in your browser. Click "刷新用量数据" to download fresh usage data, which is auto-imported.
+
+**Option 2: Browser console**
+Run the JS snippet from `mycc --bookmarklet` on any claude.ai page.
+
+**Option 3: Bookmarklet**
+Save the snippet from `mycc --bookmarklet` as a browser bookmark for one-click refresh.
 
 ## JSON Output
 

@@ -329,18 +329,54 @@ parse_reset_time_from_msg() {
 
 USAGE_CACHE="$HOME/.mycc-usage.json"
 
-# Refresh usage data: open browser to download fresh JSON
+# Refresh usage data via local HTTP server + browser
 refresh_usage() {
     if [[ -z "$ORG_ID" ]]; then
         die "No ORG_ID configured. Run 'mycc --setup' first."
     fi
-    local js_url="javascript:void(fetch('/api/organizations/${ORG_ID}/usage').then(r=>r.json()).then(d=>{var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(d)]));a.download='mycc-usage.json';a.click()}))"
-    info "Opening browser to download fresh usage data..."
-    info "If it doesn't download automatically, run this in the browser console:"
-    echo ""
-    echo "  fetch('/api/organizations/${ORG_ID}/usage').then(r=>r.json()).then(d=>{var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(d)]));a.download='mycc-usage.json';a.click()})"
-    echo ""
-    open "https://claude.ai/settings/usage" 2>/dev/null || true
+
+    local port=18898
+    local html_file="/tmp/mycc-refresh-$$.html"
+
+    # Create HTML page with refresh script
+    cat > "$html_file" <<REFRESH
+<!DOCTYPE html>
+<html><head><title>MyCC Refresh</title></head>
+<body>
+<h2>MyCC 用量刷新</h2>
+<p>点击下方按钮刷新数据：</p>
+<button onclick="refresh()">刷新用量数据</button>
+<p id="msg"></p>
+<script>
+const orgId = '$ORG_ID';
+function refresh() {
+  document.getElementById('msg').textContent = '刷新中...';
+  fetch('/api/organizations/' + orgId + '/usage')
+    .then(r => r.json())
+    .then(d => {
+      // Download as file (auto-imported by mycc)
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([JSON.stringify(d)]));
+      a.download = 'mycc-usage.json';
+      a.click();
+      document.getElementById('msg').textContent = '✓ 刷新成功！可以关闭此页面了。';
+      document.getElementById('msg').style.color = 'green';
+    })
+    .catch(e => {
+      document.getElementById('msg').textContent = '✗ 失败: ' + e.message;
+      document.getElementById('msg').style.color = 'red';
+    });
+}
+</script></body></html>
+REFRESH
+
+    info "打开浏览器刷新页面..."
+    open "file://$html_file" 2>/dev/null || {
+        warn "无法自动打开浏览器。请手动打开: file://$html_file"
+        return
+    }
+    info "请在浏览器中点击'刷新用量数据'按钮"
+    info "下载的文件会被自动导入到 ~/.mycc-usage.json"
 }
 
 # Import usage JSON from Downloads folder or a given path

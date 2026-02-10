@@ -99,17 +99,13 @@ mycc -d --launch  # 启动 Claude + 详细状态栏
 mycc --setup
 ```
 
-按提示操作，设置你的 Organization ID。然后通过浏览器控制台下载用量数据：
+按提示操作，设置你的 Organization ID。
 
-1. 在 claude.ai 打开浏览器开发者工具（F12）
-2. 在 Console 里运行 `mycc --bookmarklet` 给出的 JS 片段
-3. 会自动下载 `mycc-usage.json`
-4. MyCC 下次运行时自动导入
-
-也可以创建**书签**一键刷新：
+**刷新用量数据：**
 ```bash
-mycc --bookmarklet
+mycc --refresh
 ```
+这会打开一个本地 HTML 页面，点击「刷新用量数据」按钮即可下载最新数据，自动导入到缓存。
 
 Cloudflare 会拦截 curl/脚本的直接 API 调用，所以通过浏览器获取数据是唯一可靠的方式。
 
