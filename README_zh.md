@@ -18,13 +18,14 @@ MyCC 把这三件事自动化：**监控 -> 倒计时 -> 自动恢复**。
 
 ```bash
 # 下载到 ~/bin（或任何在 PATH 中的目录）
-cp mycc ~/bin/mycc
-chmod +x ~/bin/mycc
+curl -fsSL https://raw.githubusercontent.com/Web3ok/MyCC/main/mycc -o ~/.local/bin/mycc
+chmod +x ~/.local/bin/mycc
 ```
 
 依赖：
 - **基础模式**：零依赖（bash + macOS 自带工具）
 - **详细模式**：需要 `jq`（`brew install jq`）
+- **启动模式**：需要 `tmux`（`brew install tmux`）
 
 ## 快速开始
 
@@ -74,26 +75,23 @@ mycc              # 等待 + 自动恢复
 
 - 零配置，开箱即用
 - 只能看到"是否触限"和"何时恢复"
-- 不需要浏览器 sessionKey
 
 ### 详细模式（`-d`）
 
-调用 claude.ai API，获取所有维度的精确使用百分比。
+显示所有维度的精确使用百分比。
 
 ```bash
 mycc -d --check   # 查看各维度额度
 mycc -d --launch  # 启动 Claude + 详细状态栏
 ```
 
-显示 4 个维度：
+显示维度（按实际套餐而定）：
 | 维度 | 说明 |
 |------|------|
 | 5-Hour | 5 小时滚动窗口（最常触的限） |
 | 7-Day | 7 天总额度 |
-| Opus | 7 天 Opus 模型专用额度 |
-| Sonnet | 7 天 Sonnet 模型专用额度 |
-
-需要配置 sessionKey（见下文）。
+| Opus | 7 天 Opus 模型专用额度（如有） |
+| Sonnet | 7 天 Sonnet 模型专用额度（如有） |
 
 ## 配置详细模式
 
@@ -101,16 +99,19 @@ mycc -d --launch  # 启动 Claude + 详细状态栏
 mycc --setup
 ```
 
-按提示操作：
+按提示操作，设置你的 Organization ID。然后通过浏览器控制台下载用量数据：
 
-1. 在浏览器打开 https://claude.ai，确保已登录
-2. 按 `Cmd+Option+I` 打开开发者工具
-3. 进入 **Application** 标签页
-4. 左侧 **Cookies** > **https://claude.ai**
-5. 找到 `sessionKey`，复制它的 **Value**
-6. 粘贴到终端
+1. 在 claude.ai 打开浏览器开发者工具（F12）
+2. 在 Console 里运行 `mycc --bookmarklet` 给出的 JS 片段
+3. 会自动下载 `mycc-usage.json`
+4. MyCC 下次运行时自动导入
 
-配置保存在 `~/.mycc.conf`（权限 600）。
+也可以创建**书签**一键刷新：
+```bash
+mycc --bookmarklet
+```
+
+Cloudflare 会拦截 curl/脚本的直接 API 调用，所以通过浏览器获取数据是唯一可靠的方式。
 
 ## 全部命令参考
 
@@ -119,7 +120,7 @@ Usage: mycc [OPTIONS]
 
 模式:
   (无参数)             基础模式 - 通过 claude CLI 检测限额
-  -d, --detailed       详细模式 - 调用 claude.ai API
+  -d, --detailed       详细模式 - 浏览器数据驱动的使用率 %
 
 自动恢复:
   -c, --continue       继续上次对话（默认）
@@ -134,12 +135,12 @@ Usage: mycc [OPTIONS]
 
 配置:
   --setup              交互式配置向导
-  --session-key KEY    临时覆盖 sessionKey
   --org-id ID          临时覆盖 orgId
+  --refresh            打开浏览器下载最新用量数据
+  --bookmarklet        显示一键刷新书签
 
 显示:
   --compact            单行状态栏（用于 tmux 窗格）
-  -q, --quiet          精简输出
   --no-color           禁用颜色
   --json               JSON 格式输出
   --check              检查一次后退出
@@ -149,6 +150,20 @@ Usage: mycc [OPTIONS]
   -h, --help           帮助
   -v, --version        版本
 ```
+
+## 配置文件
+
+`~/.mycc.conf`（由 `--setup` 生成）：
+
+| 字段 | 说明 | 默认值 |
+|------|------|--------|
+| ORG_ID | Claude.ai 组织 UUID | （由 `--setup` 设置） |
+| RESUME_MODE | 恢复模式：`continue` 或 `new` | `continue` |
+| RESUME_PROMPT | 恢复时发送的 prompt | `continue` |
+| REFRESH_INTERVAL | compact 模式刷新间隔（秒） | `120` |
+| NOTIFY | 恢复时是否弹 macOS 通知 | `true` |
+
+用量缓存：`~/.mycc-usage.json`（从 `~/Downloads/mycc-usage.json` 自动导入）
 
 ## 使用场景
 
@@ -180,13 +195,7 @@ mycc -p "run all tests and fix failures"
 mycc -d --check
 ```
 
-### 场景 5：在另一个终端标签持续监控
-
-```bash
-mycc -d --compact
-```
-
-### 场景 6：集成到脚本或工具链
+### 场景 5：集成到脚本或工具链
 
 ```bash
 status=$(mycc --json)
@@ -195,44 +204,13 @@ if echo "$status" | jq -r '.status' | grep -q limited; then
 fi
 ```
 
-## 配置文件
-
-`~/.mycc.conf`（由 `--setup` 生成）：
-
-```ini
-# MyCC configuration
-SESSION_KEY=sk-ant-sid01-...
-ORG_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-RESUME_MODE=continue
-RESUME_PROMPT=continue
-REFRESH_INTERVAL=120
-NOTIFY=true
-```
-
-| 字段 | 说明 | 默认值 |
-|------|------|--------|
-| SESSION_KEY | Claude.ai 浏览器 session cookie | （空，详细模式必需） |
-| ORG_ID | 组织 ID（`--setup` 自动获取） | （空，自动发现） |
-| RESUME_MODE | 恢复模式：`continue` 或 `new` | `continue` |
-| RESUME_PROMPT | 恢复时发送的 prompt | `continue` |
-| REFRESH_INTERVAL | 详细模式 API 刷新间隔（秒） | `120` |
-| NOTIFY | 恢复时是否弹 macOS 通知 | `true` |
-
 ## 安全说明
 
 - 配置文件权限自动设为 `600`（仅本人可读）
-- sessionKey 存在本地，不会上传到任何地方
+- 不存储 API 密钥或会话令牌 — 用量数据通过浏览器获取
 - 自动恢复使用 `--dangerously-skip-permissions` 标志，会跳过权限确认
 - 建议仅在可信环境和可信 prompt 下使用自动恢复功能
-
-## 技术细节
-
-- 单文件 Shell 脚本，约 900 行
-- macOS 原生兼容（BSD `date`，`perl` 替代 `timeout`）
-- 也兼容 Linux（自动检测 GNU/BSD 工具链）
-- tmux 集成：`--launch` 自动创建分屏会话
-- 颜色编码：<50% 绿 / <70% 黄 / <90% 红 / >=90% 加粗红
-- 错误处理：API 401 提示过期、403 提示 Cloudflare、429 自动退避
+- 无遥测、无分析、脚本不发起任何网络请求
 
 ## 测试
 
@@ -254,7 +232,7 @@ mycc --test-mode 5 --json | jq .
 
 MyCC 融合了以下开源项目的核心思路：
 
-- [Claude-Code-Usage-Monitor](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor) (6.4k stars) — 实时 token 监控 + ML 预测
+- [Claude-Code-Usage-Monitor](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor) (6.4k stars) — 实时 token 监控
 - [claude-auto-resume](https://github.com/terryso/claude-auto-resume) (662 stars) — 限额自动恢复
 - [Usage4Claude](https://github.com/f-is-h/Usage4Claude) (167 stars) — macOS 菜单栏多维度额度监控
 

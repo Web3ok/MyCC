@@ -184,9 +184,10 @@ Auto-resume:
   -w, --watch          Keep watching after resume (loop mode)
 
 Configuration:
-  --setup              Interactive credential setup wizard
-  --session-key KEY    Override session key (one-time)
+  --setup              Interactive setup wizard
   --org-id ID          Override organization ID (one-time)
+  --refresh            Open browser to download fresh usage data
+  --bookmarklet        Show bookmarklet for one-click refresh
 
 Launch:
   --launch             Start tmux: Claude Code (top) + status bar (bottom)
@@ -222,8 +223,9 @@ parse_args() {
             --no-resume)      AUTO_RESUME=false; shift ;;
             -w|--watch)       WATCH_MODE=true; shift ;;
             --setup)          setup_wizard; trap - EXIT; exit 0 ;;
-            --session-key)    [[ -z "${2:-}" ]] && die "--session-key requires a value"; SESSION_KEY="$2"; shift 2 ;;
             --org-id)         [[ -z "${2:-}" ]] && die "--org-id requires a value"; ORG_ID="$2"; shift 2 ;;
+            --refresh)        REFRESH_CMD=true; shift ;;
+            --bookmarklet)    BOOKMARKLET_CMD=true; shift ;;
             --launch)         LAUNCH=true; shift; if [[ -n "${1:-}" && "${1:-}" != --* ]]; then LAUNCH_ARGS="$1"; shift; fi ;;
             --compact)        COMPACT=true; WATCH_MODE=true; AUTO_RESUME=false; shift ;;
             -q|--quiet)       QUIET=true; shift ;;
@@ -392,9 +394,10 @@ check_detailed() {
     FIVE_HOUR_RESETS=$(echo "$body" | jq -r '.five_hour.resets_at // empty')
     SEVEN_DAY_PCT=$(echo "$body" | jq -r '.seven_day.utilization // 0')
     SEVEN_DAY_RESETS=$(echo "$body" | jq -r '.seven_day.resets_at // empty')
-    OPUS_PCT=$(echo "$body" | jq -r '.seven_day_opus.utilization // 0')
+    # Opus/Sonnet may be null (no separate limit) — use empty string to distinguish from 0%
+    OPUS_PCT=$(echo "$body" | jq -r 'if .seven_day_opus then (.seven_day_opus.utilization // 0) else "" end')
     OPUS_RESETS=$(echo "$body" | jq -r '.seven_day_opus.resets_at // empty')
-    SONNET_PCT=$(echo "$body" | jq -r '.seven_day_sonnet.utilization // 0')
+    SONNET_PCT=$(echo "$body" | jq -r 'if .seven_day_sonnet then (.seven_day_sonnet.utilization // 0) else "" end')
     SONNET_RESETS=$(echo "$body" | jq -r '.seven_day_sonnet.resets_at // empty')
 
     # Determine which limit is hit (if any)
@@ -507,7 +510,7 @@ render_detailed_body() {
     local W="$1"
 
     local dimensions=("5-Hour" "7-Day" "Opus" "Sonnet")
-    local pcts=("${FIVE_HOUR_PCT:-0}" "${SEVEN_DAY_PCT:-0}" "${OPUS_PCT:-0}" "${SONNET_PCT:-0}")
+    local pcts=("${FIVE_HOUR_PCT:-0}" "${SEVEN_DAY_PCT:-0}" "${OPUS_PCT:-}" "${SONNET_PCT:-}")
     local resets_arr=("${FIVE_HOUR_RESETS:-}" "${SEVEN_DAY_RESETS:-}" "${OPUS_RESETS:-}" "${SONNET_RESETS:-}")
 
     for idx in "${!dimensions[@]}"; do
@@ -515,7 +518,8 @@ render_detailed_body() {
         local pct="${pcts[$idx]}"
         local reset_iso="${resets_arr[$idx]}"
 
-        if [[ "$pct" == "0" && -z "$reset_iso" ]]; then
+        # Skip dimensions that are null (empty pct) from the API
+        if [[ -z "$pct" ]]; then
             continue
         fi
 
@@ -712,6 +716,27 @@ CONFEOF
     fi
 }
 
+show_bookmarklet() {
+    if [[ -z "$ORG_ID" ]]; then
+        die "No ORG_ID configured. Run 'mycc --setup' first."
+    fi
+    echo ""
+    echo -e "${C_BOLD}MyCC Bookmarklet${C_RESET}"
+    echo "================"
+    echo ""
+    echo "Create a bookmark in your browser with this URL:"
+    echo ""
+    echo "  javascript:void(fetch('/api/organizations/${ORG_ID}/usage').then(r=>r.json()).then(d=>{var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(d)]));a.download='mycc-usage.json';a.click()}))"
+    echo ""
+    echo "Click it on any claude.ai page to download fresh usage data."
+    echo "MyCC will auto-import from ~/Downloads/mycc-usage.json."
+    echo ""
+    echo "Or run in browser console (F12):"
+    echo ""
+    echo "  fetch('/api/organizations/${ORG_ID}/usage').then(r=>r.json()).then(d=>{var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(d)]));a.download='mycc-usage.json';a.click()})"
+    echo ""
+}
+
 # ============================================
 # JSON Output
 # ============================================
@@ -809,9 +834,9 @@ render_compact() {
         }
 
         line+=" $(mini_bar "${FIVE_HOUR_PCT:-0}" "5h")"
-        [[ "${SEVEN_DAY_PCT:-0}" != "0" ]] && line+="  $(mini_bar "${SEVEN_DAY_PCT:-0}" "7d")"
-        [[ "${OPUS_PCT:-0}" != "0" ]] && line+="  $(mini_bar "${OPUS_PCT:-0}" "Op")"
-        [[ "${SONNET_PCT:-0}" != "0" ]] && line+="  $(mini_bar "${SONNET_PCT:-0}" "So")"
+        [[ -n "${SEVEN_DAY_PCT:-}" ]] && line+="  $(mini_bar "${SEVEN_DAY_PCT}" "7d")"
+        [[ -n "${OPUS_PCT:-}" ]] && line+="  $(mini_bar "${OPUS_PCT}" "Op")"
+        [[ -n "${SONNET_PCT:-}" ]] && line+="  $(mini_bar "${SONNET_PCT}" "So")"
     fi
 
     # Status + countdown
@@ -932,6 +957,18 @@ main() {
     if [[ "$NO_COLOR" == "true" ]] || [[ ! -t 1 ]]; then
         C_RESET="" C_RED="" C_GREEN="" C_YELLOW="" C_BLUE=""
         C_MAGENTA="" C_CYAN="" C_BOLD="" C_DIM=""
+    fi
+
+    # Handle --bookmarklet
+    if [[ "${BOOKMARKLET_CMD:-}" == "true" ]]; then
+        show_bookmarklet
+        trap - EXIT; exit 0
+    fi
+
+    # Handle --refresh
+    if [[ "${REFRESH_CMD:-}" == "true" ]]; then
+        refresh_usage
+        trap - EXIT; exit 0
     fi
 
     # Capture mode before validation (for --launch to pass through)

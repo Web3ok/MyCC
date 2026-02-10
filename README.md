@@ -18,12 +18,12 @@ MyCC solves all three: **monitor → countdown → auto-resume**.
 
 ## Features
 
-- **Real-time quota monitoring** — See 5-hour, 7-day, Opus, and Sonnet usage at a glance
+- **Real-time quota monitoring** — See 5-hour, 7-day, and per-model usage at a glance
 - **Precise countdown** — Know exactly when your limit resets, down to the second
 - **Auto-resume** — Automatically continues your Claude Code session when the limit lifts
 - **tmux integration** — `--launch` starts Claude Code with a live status bar at the bottom
-- **Dual mode** — Basic (zero-config CLI detection) or Detailed (claude.ai API with full % breakdown)
-- **Single file** — One shell script, ~900 lines, zero dependencies for basic mode
+- **Dual mode** — Basic (zero-config CLI detection) or Detailed (browser-sourced % breakdown)
+- **Single file** — One shell script, ~1000 lines, zero dependencies for basic mode
 - **macOS + Linux** — Works on both (auto-detects BSD/GNU tools)
 
 ## Install
@@ -40,7 +40,7 @@ chmod +x ~/.local/bin/mycc
 ```
 
 Requirements:
-- **Basic mode**: No dependencies (bash, curl, grep, perl — all pre-installed on macOS/Linux)
+- **Basic mode**: No dependencies (bash, grep, perl — all pre-installed on macOS/Linux)
 - **Detailed mode**: `jq` (`brew install jq` / `apt install jq`)
 - **Launch mode**: `tmux` (`brew install tmux` / `apt install tmux`)
 
@@ -85,7 +85,7 @@ mycc --check
 
 ### Detailed Mode (`-d`)
 
-Calls the claude.ai API for precise utilization percentages across all dimensions.
+Shows precise utilization percentages across all quota dimensions.
 
 ```bash
 mycc -d --check
@@ -99,7 +99,14 @@ Requires a one-time setup:
 mycc --setup
 ```
 
-This will guide you to copy your `sessionKey` from the browser (claude.ai cookies).
+Detailed mode reads usage data from a local cache file (`~/.mycc-usage.json`).
+To populate it, run a one-liner in your browser console at claude.ai (the setup wizard provides the exact command). Cloudflare blocks direct API calls from curl/scripts, so the browser acts as a trusted client.
+
+You can also create a **bookmarklet** for one-click refresh:
+
+```bash
+mycc --bookmarklet
+```
 
 ## Usage Reference
 
@@ -108,7 +115,7 @@ Usage: mycc [OPTIONS]
 
 Modes:
   (no flag)            Basic mode - detect limits via claude CLI
-  -d, --detailed       Detailed mode - Claude.ai API for utilization %
+  -d, --detailed       Detailed mode - browser-sourced utilization %
 
 Auto-resume:
   -c, --continue       Continue previous conversation (default)
@@ -122,9 +129,10 @@ Launch:
   --launch "ARGS"      Same, but pass ARGS to claude (e.g. --launch "-c")
 
 Configuration:
-  --setup              Interactive credential setup wizard
-  --session-key KEY    Override session key (one-time)
+  --setup              Interactive setup wizard
   --org-id ID          Override organization ID (one-time)
+  --refresh            Open browser to download fresh usage data
+  --bookmarklet        Show bookmarklet for one-click refresh
 
 Display:
   --compact            Single-line status bar (for tmux pane)
@@ -144,12 +152,19 @@ Config file: `~/.mycc.conf` (created by `mycc --setup`, permissions `600`)
 
 | Field | Description | Default |
 |-------|-------------|---------|
-| SESSION_KEY | claude.ai browser session cookie | (empty, required for `-d`) |
-| ORG_ID | Organization UUID (auto-discovered) | (empty, auto) |
+| ORG_ID | Claude.ai organization UUID | (from `--setup`) |
 | RESUME_MODE | `continue` or `new` | `continue` |
 | RESUME_PROMPT | Prompt sent when resuming | `continue` |
-| REFRESH_INTERVAL | API refresh interval in seconds | `120` |
+| REFRESH_INTERVAL | Compact mode refresh interval (seconds) | `120` |
 | NOTIFY | macOS desktop notification on resume | `true` |
+
+Usage data cache: `~/.mycc-usage.json` (auto-imported from `~/Downloads/mycc-usage.json`)
+
+### How to refresh usage data
+
+1. **Browser console**: Run the JS snippet from `mycc --bookmarklet` on any claude.ai page
+2. **Bookmarklet**: Save the snippet as a browser bookmark for one-click refresh
+3. The downloaded `mycc-usage.json` is auto-imported on next `mycc -d` run
 
 ## JSON Output
 
@@ -161,12 +176,10 @@ mycc -d --check --json | jq .
 
 ```json
 {
-  "status": "limited",
-  "limit_name": "5-hour",
-  "five_hour":  { "pct": 100, "resets_at": "2026-02-10T09:00:00Z" },
-  "seven_day":  { "pct": 31,  "resets_at": "2026-02-14T00:00:00Z" },
-  "opus":       { "pct": 100, "resets_at": "2026-02-12T09:00:00Z" },
-  "sonnet":     { "pct": 22,  "resets_at": "2026-02-15T00:00:00Z" }
+  "status": "ok",
+  "five_hour":  { "pct": 75,  "resets_at": "2026-02-10T12:00:00Z" },
+  "seven_day":  { "pct": 78,  "resets_at": "2026-02-14T23:00:00Z" },
+  "sonnet":     { "pct": 12,  "resets_at": "2026-02-14T23:00:00Z" }
 }
 ```
 
@@ -182,9 +195,9 @@ mycc --test-mode 5 --json        # Simulate JSON output
 ## Security
 
 - Config file is `chmod 600` (owner-only read/write)
-- sessionKey is stored locally, never transmitted except to claude.ai
+- No API keys or session tokens stored — usage data is fetched via the browser
 - Auto-resume uses `--dangerously-skip-permissions` — only use in trusted environments with trusted prompts
-- No telemetry, no analytics, no network calls except to claude.ai API
+- No telemetry, no analytics, no outbound network calls from the script
 
 ## Inspired By
 
