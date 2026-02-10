@@ -1,0 +1,1010 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================
+# MyCC (My Claude Code) - quota monitor + auto-resume
+# Combines monitoring + countdown + auto-resume for Claude Code
+# ============================================
+
+VERSION="1.0.0"
+CONF_FILE="$HOME/.mycc.conf"
+
+# --- Defaults ---
+MODE="basic"
+RESUME_MODE="continue"
+RESUME_PROMPT="continue"
+AUTO_RESUME=true
+WATCH_MODE=false
+CHECK_ONLY=false
+OUTPUT_JSON=false
+QUIET=false
+NO_COLOR=false
+NOTIFY=true
+REFRESH_INTERVAL=120
+TEST_MODE_SECS=""
+SESSION_KEY=""
+ORG_ID=""
+COMPACT=false
+LAUNCH=false
+LAUNCH_ARGS=""
+LAUNCH_DETAILED=false
+
+# --- State ---
+LIMIT_DETECTED=false
+LIMIT_NAME=""
+RESET_TIMESTAMP=""
+FIVE_HOUR_PCT="" FIVE_HOUR_RESETS=""
+SEVEN_DAY_PCT="" SEVEN_DAY_RESETS=""
+OPUS_PCT="" OPUS_RESETS=""
+SONNET_PCT="" SONNET_RESETS=""
+IS_GNU_DATE=false
+RAW_LIMIT_MSG=""
+
+# --- ANSI Colors ---
+C_RESET="\033[0m"
+C_RED="\033[31m"
+C_GREEN="\033[32m"
+C_YELLOW="\033[33m"
+C_BLUE="\033[34m"
+C_MAGENTA="\033[35m"
+C_CYAN="\033[36m"
+C_BOLD="\033[1m"
+C_DIM="\033[2m"
+
+# ============================================
+# Utility Functions
+# ============================================
+
+info()  { echo -e "${C_CYAN}[INFO]${C_RESET} $*"; }
+warn()  { echo -e "${C_YELLOW}[WARN]${C_RESET} $*" >&2; }
+error() { echo -e "${C_RED}[ERROR]${C_RESET} $*" >&2; }
+die()   { error "$@"; exit 1; }
+
+detect_os() {
+    if date --version &>/dev/null; then
+        IS_GNU_DATE=true
+    else
+        IS_GNU_DATE=false
+    fi
+}
+
+# Convert ISO 8601 (UTC) to epoch seconds
+iso_to_epoch() {
+    local iso="$1"
+    [[ -z "$iso" ]] && return 1
+    # Strip fractional seconds: 2026-02-10T15:00:00.123Z -> 2026-02-10T15:00:00Z
+    local cleaned
+    cleaned=$(echo "$iso" | sed -E 's/\.[0-9]+Z$/Z/')
+    if $IS_GNU_DATE; then
+        date -d "$cleaned" +%s
+    else
+        # BSD date: strip Z, replace T with space
+        local dt="${cleaned%Z}"
+        dt="${dt//T/ }"
+        date -j -u -f "%Y-%m-%d %H:%M:%S" "$dt" +%s
+    fi
+}
+
+# Format seconds to human-readable duration
+format_duration() {
+    local secs="$1"
+    local days=$(( secs / 86400 ))
+    local hours=$(( (secs % 86400) / 3600 ))
+    local mins=$(( (secs % 3600) / 60 ))
+    local s=$(( secs % 60 ))
+    if (( days > 0 )); then
+        printf "%dd %02dh %02dm %02ds" "$days" "$hours" "$mins" "$s"
+    elif (( hours > 0 )); then
+        printf "%02d:%02d:%02d" "$hours" "$mins" "$s"
+    else
+        printf "%02d:%02d" "$mins" "$s"
+    fi
+}
+
+# Return ANSI color based on utilization percentage
+color_for_pct() {
+    local pct="$1"
+    if (( pct < 50 )); then echo -ne "$C_GREEN"
+    elif (( pct < 70 )); then echo -ne "$C_YELLOW"
+    elif (( pct < 90 )); then echo -ne "$C_RED"
+    else echo -ne "${C_BOLD}${C_RED}"
+    fi
+}
+
+# Render a bar graph: [████████░░░░] 65%
+bar_graph() {
+    local pct="$1"
+    local width="${2:-20}"
+    (( pct > 100 )) && pct=100
+    local filled=$(( pct * width / 100 ))
+    local empty=$(( width - filled ))
+    local bar=""
+    local i
+    for (( i=0; i<filled; i++ )); do bar+="█"; done
+    for (( i=0; i<empty; i++ )); do bar+="░"; done
+    local color
+    color=$(color_for_pct "$pct")
+    printf "%b[%s]%b %3d%%" "$color" "$bar" "$C_RESET" "$pct"
+}
+
+# Run command with timeout (macOS compatible)
+run_with_timeout() {
+    local secs="$1"; shift
+    perl -e "alarm $secs; exec @ARGV" -- "$@"
+}
+
+# ============================================
+# Configuration
+# ============================================
+
+load_config() {
+    if [[ -f "$CONF_FILE" ]]; then
+        local perms
+        perms=$(stat -f '%Lp' "$CONF_FILE" 2>/dev/null || stat -c '%a' "$CONF_FILE" 2>/dev/null)
+        if [[ "$perms" != "600" ]]; then
+            warn "Config file permissions are $perms, should be 600. Run: chmod 600 $CONF_FILE"
+        fi
+        # Source config, overriding defaults
+        local key val
+        while IFS='=' read -r key val; do
+            key=$(echo "$key" | xargs)
+            [[ -z "$key" || "$key" == \#* ]] && continue
+            val=$(echo "$val" | sed 's/^["'"'"']//; s/["'"'"']$//')
+            case "$key" in
+                SESSION_KEY)       [[ -z "$SESSION_KEY" ]] && SESSION_KEY="$val" ;;
+                ORG_ID)            [[ -z "$ORG_ID" ]] && ORG_ID="$val" ;;
+                RESUME_MODE)       RESUME_MODE="$val" ;;
+                RESUME_PROMPT)     RESUME_PROMPT="$val" ;;
+                REFRESH_INTERVAL)  REFRESH_INTERVAL="$val" ;;
+                NOTIFY)            NOTIFY="$val" ;;
+            esac
+        done < "$CONF_FILE"
+    fi
+}
+
+# ============================================
+# CLI Argument Parsing
+# ============================================
+
+show_help() {
+    cat <<'HELP'
+mycc - Claude Code quota monitor + auto-resume
+
+Usage: mycc [OPTIONS]
+
+Modes:
+  (no flag)            Basic mode - detect limits via claude CLI
+  -d, --detailed       Detailed mode - Claude.ai API for utilization %
+
+Auto-resume:
+  -c, --continue       Continue previous conversation (default)
+  -n, --new            Start new session when resuming
+  -p, --prompt TEXT    Custom resume prompt (default: "continue")
+  --no-resume          Monitor only, don't auto-resume
+  -w, --watch          Keep watching after resume (loop mode)
+
+Configuration:
+  --setup              Interactive credential setup wizard
+  --session-key KEY    Override session key (one-time)
+  --org-id ID          Override organization ID (one-time)
+
+Launch:
+  --launch             Start tmux: Claude Code (top) + status bar (bottom)
+  --launch "ARGS"      Same, but pass ARGS to claude (e.g. --launch "-c")
+
+Display:
+  --compact            Single-line status bar (for tmux pane)
+  -q, --quiet          Minimal output
+  --no-color           Disable ANSI colors
+  --json               Output status as JSON
+  --check              One-shot status check, then exit
+
+Other:
+  --test-mode SECS     Simulate rate limit (for testing)
+  -h, --help           Show this help
+  -v, --version        Show version
+
+Examples:
+  mycc --launch          # Start Claude + live status bar
+  mycc --launch "-c"     # Continue previous session + bar
+  mycc -d --compact      # Detailed compact bar (standalone)
+  mycc --test-mode 10    # Test with simulated limit
+HELP
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -d|--detailed)    MODE=detailed; shift ;;
+            -c|--continue)    RESUME_MODE=continue; shift ;;
+            -n|--new)         RESUME_MODE=new; shift ;;
+            -p|--prompt)      [[ -z "${2:-}" ]] && die "-p requires a value"; RESUME_PROMPT="$2"; shift 2 ;;
+            --no-resume)      AUTO_RESUME=false; shift ;;
+            -w|--watch)       WATCH_MODE=true; shift ;;
+            --setup)          setup_wizard; trap - EXIT; exit 0 ;;
+            --session-key)    [[ -z "${2:-}" ]] && die "--session-key requires a value"; SESSION_KEY="$2"; shift 2 ;;
+            --org-id)         [[ -z "${2:-}" ]] && die "--org-id requires a value"; ORG_ID="$2"; shift 2 ;;
+            --launch)         LAUNCH=true; shift; if [[ -n "${1:-}" && "${1:-}" != --* ]]; then LAUNCH_ARGS="$1"; shift; fi ;;
+            --compact)        COMPACT=true; WATCH_MODE=true; AUTO_RESUME=false; shift ;;
+            -q|--quiet)       QUIET=true; shift ;;
+            --no-color)       NO_COLOR=true; shift ;;
+            --json)           OUTPUT_JSON=true; shift ;;
+            --check)          CHECK_ONLY=true; AUTO_RESUME=false; shift ;;
+            --test-mode)      [[ -z "${2:-}" ]] && die "--test-mode requires seconds"; TEST_MODE_SECS="$2"; shift 2 ;;
+            -h|--help)        show_help; trap - EXIT; exit 0 ;;
+            -v|--version)     echo "mycc v${VERSION}"; trap - EXIT; exit 0 ;;
+            *)                die "Unknown option: $1. Use --help for usage." ;;
+        esac
+    done
+}
+
+# ============================================
+# Basic Mode: CLI Detection
+# ============================================
+
+check_basic() {
+    info "Checking Claude Code status..."
+    local output exit_code=0
+    output=$(run_with_timeout 120 claude -p 'check' 2>&1) || exit_code=$?
+
+    # Pattern 1: "hit your limit · resets 3am" or "hit your limit · resets 3am (Europe/Paris)"
+    # Pattern 2: "5-hour limit reached · resets 3am"
+    # Pattern 3: Old pipe format "Claude AI usage limit reached|<timestamp>"
+    local limit_line
+    limit_line=$(echo "$output" | grep -E "(hit your limit|limit reached).*resets" || true)
+
+    if [[ -n "$limit_line" ]]; then
+        LIMIT_DETECTED=true
+        RAW_LIMIT_MSG="$limit_line"
+        parse_reset_time_from_msg "$limit_line"
+        return
+    fi
+
+    # Old pipe format
+    limit_line=$(echo "$output" | grep -F "usage limit reached|" || true)
+    if [[ -n "$limit_line" ]]; then
+        LIMIT_DETECTED=true
+        RAW_LIMIT_MSG="$limit_line"
+        RESET_TIMESTAMP=$(echo "$limit_line" | awk -F'|' '{print $2}' | tr -d '[:space:]')
+        return
+    fi
+
+    LIMIT_DETECTED=false
+}
+
+parse_reset_time_from_msg() {
+    local msg="$1"
+    # Extract reset time like "3am", "11pm", "12am"
+    local reset_raw
+    reset_raw=$(echo "$msg" | grep -oE 'resets [0-9]{1,2}[ap]m' | awk '{print $2}')
+    if [[ -z "$reset_raw" ]]; then
+        warn "Could not parse reset time from: $msg"
+        # Fallback: 30 minutes from now
+        RESET_TIMESTAMP=$(( $(date +%s) + 1800 ))
+        LIMIT_NAME="unknown"
+        return
+    fi
+
+    local hour period hour24
+    hour=$(echo "$reset_raw" | sed 's/[ap]m$//')
+    period=$(echo "$reset_raw" | grep -oE '[ap]m$')
+
+    if [[ "$period" == "am" ]]; then
+        hour24=$(( hour == 12 ? 0 : hour ))
+    else
+        hour24=$(( hour == 12 ? 12 : hour + 12 ))
+    fi
+
+    local now_ts today_reset
+    now_ts=$(date +%s)
+
+    if $IS_GNU_DATE; then
+        today_reset=$(date -d "today ${hour24}:00:00" +%s)
+    else
+        today_reset=$(date -j -f "%Y-%m-%d %H:%M:%S" "$(date +%Y-%m-%d) $(printf '%02d' $hour24):00:00" +%s)
+    fi
+
+    if (( now_ts > today_reset )); then
+        # Reset is tomorrow
+        if $IS_GNU_DATE; then
+            RESET_TIMESTAMP=$(date -d "tomorrow ${hour24}:00:00" +%s)
+        else
+            local tomorrow
+            tomorrow=$(date -j -v+1d +%Y-%m-%d)
+            RESET_TIMESTAMP=$(date -j -f "%Y-%m-%d %H:%M:%S" "${tomorrow} $(printf '%02d' $hour24):00:00" +%s)
+        fi
+    else
+        RESET_TIMESTAMP=$today_reset
+    fi
+
+    # Extract limit name if present
+    LIMIT_NAME=$(echo "$msg" | grep -oE '[0-9]+-hour' || echo "usage")
+}
+
+# ============================================
+# Detailed Mode: Claude.ai API
+# ============================================
+
+api_curl() {
+    local url="$1"
+    curl -s -w "\n%{http_code}" \
+        --max-time 15 \
+        -H "accept: */*" \
+        -H "content-type: application/json" \
+        -H "anthropic-client-platform: web_claude_ai" \
+        -H "anthropic-client-version: 1.0.0" \
+        -H "user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
+        -H "origin: https://claude.ai" \
+        -H "referer: https://claude.ai/settings/usage" \
+        -H "sec-fetch-dest: empty" \
+        -H "sec-fetch-mode: cors" \
+        -H "sec-fetch-site: same-origin" \
+        -H "Cookie: sessionKey=${SESSION_KEY}" \
+        "$url"
+}
+
+fetch_org_id() {
+    local response http_code body
+    response=$(api_curl "https://claude.ai/api/organizations")
+    http_code=$(echo "$response" | tail -1)
+    body=$(echo "$response" | sed '$d')
+
+    if [[ "$http_code" != "200" ]]; then
+        die "Failed to fetch organizations (HTTP $http_code). Check your sessionKey."
+    fi
+
+    if echo "$body" | grep -q '<!DOCTYPE'; then
+        die "Received HTML instead of JSON. Cloudflare may be blocking the request."
+    fi
+
+    ORG_ID=$(echo "$body" | jq -r '.[0].uuid // empty')
+    [[ -z "$ORG_ID" ]] && die "Could not extract organization ID from API response."
+    info "Discovered org: $(echo "$body" | jq -r '.[0].name // "unknown"') ($ORG_ID)"
+}
+
+check_detailed() {
+    [[ -z "$ORG_ID" ]] && fetch_org_id
+
+    local response http_code body
+    response=$(api_curl "https://claude.ai/api/organizations/${ORG_ID}/usage")
+    http_code=$(echo "$response" | tail -1)
+    body=$(echo "$response" | sed '$d')
+
+    case "$http_code" in
+        200) ;;
+        401) die "Session expired (HTTP 401). Run: mycc --setup" ;;
+        403) die "Access denied (HTTP 403). Cloudflare may be blocking. Try again later." ;;
+        429) warn "API rate limited. Retrying in 60s..."; sleep 60; check_detailed; return ;;
+        *)   die "API request failed (HTTP $http_code)" ;;
+    esac
+
+    if echo "$body" | grep -q '<!DOCTYPE'; then
+        die "Received HTML instead of JSON. Cloudflare is blocking the request."
+    fi
+
+    # Parse each limit dimension
+    FIVE_HOUR_PCT=$(echo "$body" | jq -r 'if .five_hour.utilization then (.five_hour.utilization * 100 | floor) else 0 end')
+    FIVE_HOUR_RESETS=$(echo "$body" | jq -r '.five_hour.resets_at // empty')
+    SEVEN_DAY_PCT=$(echo "$body" | jq -r 'if .seven_day.utilization then (.seven_day.utilization * 100 | floor) else 0 end')
+    SEVEN_DAY_RESETS=$(echo "$body" | jq -r '.seven_day.resets_at // empty')
+    OPUS_PCT=$(echo "$body" | jq -r 'if .seven_day_opus.utilization then (.seven_day_opus.utilization * 100 | floor) else 0 end')
+    OPUS_RESETS=$(echo "$body" | jq -r '.seven_day_opus.resets_at // empty')
+    SONNET_PCT=$(echo "$body" | jq -r 'if .seven_day_sonnet.utilization then (.seven_day_sonnet.utilization * 100 | floor) else 0 end')
+    SONNET_RESETS=$(echo "$body" | jq -r '.seven_day_sonnet.resets_at // empty')
+
+    # Determine which limit is hit (if any)
+    LIMIT_DETECTED=false
+    RESET_TIMESTAMP=""
+    LIMIT_NAME=""
+
+    local check_limit
+    check_limit() {
+        local name="$1" pct="$2" resets="$3"
+        if (( pct >= 100 )) && [[ -n "$resets" ]]; then
+            LIMIT_DETECTED=true
+            LIMIT_NAME="$name"
+            RESET_TIMESTAMP=$(iso_to_epoch "$resets")
+        fi
+    }
+
+    # Check in priority order: 5-hour first (most common)
+    check_limit "5-hour"       "${FIVE_HOUR_PCT:-0}" "${FIVE_HOUR_RESETS:-}"
+    if [[ "$LIMIT_DETECTED" != "true" ]]; then
+        check_limit "7-day Opus"   "${OPUS_PCT:-0}"      "${OPUS_RESETS:-}"
+    fi
+    if [[ "$LIMIT_DETECTED" != "true" ]]; then
+        check_limit "7-day Sonnet" "${SONNET_PCT:-0}"    "${SONNET_RESETS:-}"
+    fi
+    if [[ "$LIMIT_DETECTED" != "true" ]]; then
+        check_limit "7-day"        "${SEVEN_DAY_PCT:-0}" "${SEVEN_DAY_RESETS:-}"
+    fi
+}
+
+# ============================================
+# Terminal Display
+# ============================================
+
+draw_line() {
+    local width="$1" char="${2:-─}"
+    local i
+    for (( i=0; i<width; i++ )); do printf "%s" "$char"; done
+}
+
+# Print a box row: │ <content padded to W visible chars> │
+# $1 = visible_text (plain, no ANSI)
+# $2 = formatted_text (with ANSI codes, same visible content as $1)
+# $3 = W (box inner width)
+boxrow() {
+    local visible="$1" formatted="$2" W="$3"
+    local vlen=${#visible}
+    local pad=$(( W - vlen ))
+    (( pad < 0 )) && pad=0
+    printf "  %b│%b%s%*s%b│%b\n" "$C_DIM" "$C_RESET" "$formatted" "$pad" "" "$C_DIM" "$C_RESET"
+}
+
+render_status() {
+    local W=52
+
+    printf "\n"
+    printf "  %b┌%s┐%b\n" "$C_DIM" "$(draw_line $W)" "$C_RESET"
+    local title="  MyCC v${VERSION}"
+    boxrow "$title" "  ${C_BOLD}MyCC${C_RESET} v${VERSION}" "$W"
+    printf "  %b├%s┤%b\n" "$C_DIM" "$(draw_line $W)" "$C_RESET"
+
+    if [[ "$MODE" == "detailed" ]]; then
+        render_detailed_body "$W"
+    else
+        render_basic_body "$W"
+    fi
+
+    printf "  %b└%s┘%b\n" "$C_DIM" "$(draw_line $W)" "$C_RESET"
+}
+
+render_basic_body() {
+    local W="$1"
+
+    if [[ "$LIMIT_DETECTED" == "true" ]]; then
+        local reset_human remaining_human
+        reset_human=$(date -r "$RESET_TIMESTAMP" "+%Y-%m-%d %H:%M" 2>/dev/null || date -d "@$RESET_TIMESTAMP" "+%Y-%m-%d %H:%M" 2>/dev/null)
+        local now_ts remaining
+        now_ts=$(date +%s)
+        remaining=$(( RESET_TIMESTAMP - now_ts ))
+        (( remaining < 0 )) && remaining=0
+        remaining_human=$(format_duration "$remaining")
+
+        local s="  Status:  RATE LIMITED"
+        boxrow "$s" "  Status:  ${C_RED}RATE LIMITED${C_RESET}" "$W"
+
+        s="  Limit:   ${LIMIT_NAME} limit reached"
+        boxrow "$s" "$s" "$W"
+
+        local rl="$reset_human (in $remaining_human)"
+        s="  Resets:  $rl"
+        boxrow "$s" "  Resets:  ${C_CYAN}${rl}${C_RESET}" "$W"
+
+        if [[ "$AUTO_RESUME" == "true" ]]; then
+            local at="Auto-resume ($RESUME_MODE)"
+            s="  Action:  $at"
+            boxrow "$s" "  Action:  ${C_GREEN}${at}${C_RESET}" "$W"
+        else
+            s="  Action:  Monitor only"
+            boxrow "$s" "$s" "$W"
+        fi
+    else
+        local s="  Status:  ALL CLEAR"
+        boxrow "$s" "  Status:  ${C_GREEN}ALL CLEAR${C_RESET}" "$W"
+        s="  No rate limit detected."
+        boxrow "$s" "$s" "$W"
+    fi
+}
+
+render_detailed_body() {
+    local W="$1"
+
+    local dimensions=("5-Hour" "7-Day" "Opus" "Sonnet")
+    local pcts=("${FIVE_HOUR_PCT:-0}" "${SEVEN_DAY_PCT:-0}" "${OPUS_PCT:-0}" "${SONNET_PCT:-0}")
+    local resets_arr=("${FIVE_HOUR_RESETS:-}" "${SEVEN_DAY_RESETS:-}" "${OPUS_RESETS:-}" "${SONNET_RESETS:-}")
+
+    for idx in "${!dimensions[@]}"; do
+        local name="${dimensions[$idx]}"
+        local pct="${pcts[$idx]}"
+        local reset_iso="${resets_arr[$idx]}"
+
+        if [[ "$pct" == "0" && -z "$reset_iso" ]]; then
+            continue
+        fi
+
+        local reset_short=""
+        if [[ -n "$reset_iso" ]]; then
+            local reset_epoch
+            reset_epoch=$(iso_to_epoch "$reset_iso" 2>/dev/null || echo "")
+            if [[ -n "$reset_epoch" ]]; then
+                reset_short=$(date -r "$reset_epoch" "+%b %d %l%p" 2>/dev/null | sed 's/  / /g' || echo "")
+            fi
+        fi
+
+        local bar_str
+        bar_str=$(bar_graph "$pct" 20)
+        local label
+        label=$(printf "%-7s" "$name")
+        local reset_padded
+        reset_padded=$(printf "%-13s" "$reset_short")
+
+        # Visible: "  " + label(7) + " " + bar_visible(27) + " " + reset(13) = 51
+        # bar_visible = [xxxx] NNN% = 1+20+1+1+3+1 = 27
+        local visible_line="  ${label} $(printf '['; printf '%0.s#' $(seq 1 20); printf '] %3d%%' "$pct") ${reset_padded}"
+        # Simplified: count directly
+        local vlen=$(( 2 + 7 + 1 + 27 + 1 + 13 ))  # = 51
+        local pad=$(( W - vlen ))
+        (( pad < 0 )) && pad=0
+
+        printf "  %b│%b  %s %s %s%*s%b│%b\n" \
+            "$C_DIM" "$C_RESET" "$label" "$bar_str" "$reset_padded" "$pad" "" "$C_DIM" "$C_RESET"
+    done
+
+    boxrow "" "" "$W"
+
+    if [[ "$LIMIT_DETECTED" == "true" ]]; then
+        local st="RATE LIMITED ($LIMIT_NAME)"
+        local s="  Status: $st"
+        boxrow "$s" "  Status: ${C_RED}${st}${C_RESET}" "$W"
+
+        if [[ -n "$RESET_TIMESTAMP" ]]; then
+            local now_ts remaining remaining_human
+            now_ts=$(date +%s)
+            remaining=$(( RESET_TIMESTAMP - now_ts ))
+            (( remaining < 0 )) && remaining=0
+            remaining_human=$(format_duration "$remaining")
+            local rl="Resets in $remaining_human"
+            s="  $rl"
+            boxrow "$s" "  ${C_CYAN}${rl}${C_RESET}" "$W"
+        fi
+
+        if [[ "$AUTO_RESUME" == "true" ]]; then
+            local at="Action: Auto-resume ($RESUME_MODE)"
+            s="  $at"
+            boxrow "$s" "  ${C_GREEN}${at}${C_RESET}" "$W"
+        fi
+    else
+        local s="  Status: ALL CLEAR"
+        boxrow "$s" "  Status: ${C_GREEN}ALL CLEAR${C_RESET}" "$W"
+    fi
+}
+
+# ============================================
+# Countdown Timer
+# ============================================
+
+countdown_loop() {
+    local target_ts="$1"
+    local last_refresh=0
+
+    # Hide cursor during countdown
+    printf "\033[?25l"
+
+    while true; do
+        local now_ts
+        now_ts=$(date +%s)
+        local remaining=$(( target_ts - now_ts ))
+
+        if (( remaining <= 0 )); then
+            break
+        fi
+
+        # Periodic API refresh in detailed mode
+        if [[ "$MODE" == "detailed" && -n "$SESSION_KEY" ]]; then
+            local since_refresh=$(( now_ts - last_refresh ))
+            if (( since_refresh >= REFRESH_INTERVAL )); then
+                check_detailed 2>/dev/null || true
+                last_refresh=$now_ts
+                if [[ -n "$RESET_TIMESTAMP" ]]; then
+                    target_ts="$RESET_TIMESTAMP"
+                    remaining=$(( target_ts - now_ts ))
+                fi
+                if [[ "$LIMIT_DETECTED" != "true" ]]; then
+                    break
+                fi
+            fi
+        fi
+
+        # Render countdown
+        local dur
+        dur=$(format_duration "$remaining")
+        printf "\r  %b⏱  Countdown: %b%s%b  " "$C_DIM" "$C_CYAN" "$dur" "$C_RESET"
+
+        sleep 1
+    done
+
+    # Show cursor
+    printf "\033[?25h"
+    echo ""
+}
+
+# ============================================
+# Auto-Resume
+# ============================================
+
+resume_claude() {
+    info "Reset time reached. Waiting 10s buffer..."
+    sleep 10
+
+    # macOS desktop notification
+    if [[ "$NOTIFY" == "true" ]] && command -v osascript &>/dev/null; then
+        osascript -e 'display notification "Rate limit lifted. Resuming Claude Code..." with title "MyCC" sound name "Glass"' 2>/dev/null || true
+    fi
+
+    local cmd_display
+    if [[ "$RESUME_MODE" == "continue" ]]; then
+        cmd_display="claude -c --dangerously-skip-permissions -p \"$RESUME_PROMPT\""
+        info "Resuming: $cmd_display"
+        claude -c --dangerously-skip-permissions -p "$RESUME_PROMPT"
+    else
+        cmd_display="claude --dangerously-skip-permissions -p \"$RESUME_PROMPT\""
+        info "Resuming: $cmd_display"
+        claude --dangerously-skip-permissions -p "$RESUME_PROMPT"
+    fi
+}
+
+# ============================================
+# Setup Wizard
+# ============================================
+
+setup_wizard() {
+    echo -e "${C_BOLD}MyCC Setup${C_RESET}"
+    echo "====================="
+    echo ""
+    echo "To use detailed mode, you need your Claude.ai session key."
+    echo ""
+    echo "Steps to get it:"
+    echo "  1. Open https://claude.ai in your browser, make sure you're logged in"
+    echo "  2. Open DevTools (Cmd+Option+I) > Application tab"
+    echo "  3. Under Cookies > https://claude.ai, find 'sessionKey'"
+    echo "  4. Copy its Value"
+    echo ""
+
+    local sk
+    read -rp "Session Key (or press Enter to skip): " sk
+    SESSION_KEY="${sk:-}"
+
+    if [[ -n "$SESSION_KEY" ]]; then
+        detect_os
+        echo "Fetching organization ID..."
+        fetch_org_id
+    fi
+
+    local rm
+    read -rp "Default resume mode [continue/new] (default: continue): " rm
+    RESUME_MODE="${rm:-continue}"
+
+    local rp
+    read -rp "Default resume prompt (default: continue): " rp
+    RESUME_PROMPT="${rp:-continue}"
+
+    local ri
+    read -rp "API refresh interval in seconds (default: 120): " ri
+    REFRESH_INTERVAL="${ri:-120}"
+
+    # Write config
+    cat > "$CONF_FILE" <<EOF
+# mycc configuration
+# Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+SESSION_KEY=${SESSION_KEY}
+ORG_ID=${ORG_ID}
+RESUME_MODE=${RESUME_MODE}
+RESUME_PROMPT=${RESUME_PROMPT}
+REFRESH_INTERVAL=${REFRESH_INTERVAL}
+NOTIFY=true
+EOF
+
+    chmod 600 "$CONF_FILE"
+    echo ""
+    info "Config saved to $CONF_FILE"
+    if [[ -n "$SESSION_KEY" ]]; then
+        echo "Test with: mycc -d --check"
+    else
+        echo "Test with: mycc --check"
+    fi
+}
+
+# ============================================
+# JSON Output
+# ============================================
+
+output_json() {
+    if [[ "$MODE" == "detailed" ]]; then
+        jq -n \
+            --arg status "$([ "$LIMIT_DETECTED" == "true" ] && echo "limited" || echo "ok")" \
+            --arg limit_name "${LIMIT_NAME:-}" \
+            --argjson five_hour "${FIVE_HOUR_PCT:-0}" \
+            --arg five_hour_resets "${FIVE_HOUR_RESETS:-}" \
+            --argjson seven_day "${SEVEN_DAY_PCT:-0}" \
+            --arg seven_day_resets "${SEVEN_DAY_RESETS:-}" \
+            --argjson opus "${OPUS_PCT:-0}" \
+            --arg opus_resets "${OPUS_RESETS:-}" \
+            --argjson sonnet "${SONNET_PCT:-0}" \
+            --arg sonnet_resets "${SONNET_RESETS:-}" \
+            '{
+                status: $status,
+                limit_name: $limit_name,
+                five_hour:  { pct: $five_hour,  resets_at: $five_hour_resets },
+                seven_day:  { pct: $seven_day,  resets_at: $seven_day_resets },
+                opus:       { pct: $opus,        resets_at: $opus_resets },
+                sonnet:     { pct: $sonnet,      resets_at: $sonnet_resets }
+            }'
+    else
+        local resets_iso=""
+        if [[ -n "${RESET_TIMESTAMP:-}" ]]; then
+            if $IS_GNU_DATE; then
+                resets_iso=$(date -d "@$RESET_TIMESTAMP" -u +"%Y-%m-%dT%H:%M:%SZ")
+            else
+                resets_iso=$(date -r "$RESET_TIMESTAMP" -u +"%Y-%m-%dT%H:%M:%SZ")
+            fi
+        fi
+        jq -n \
+            --arg status "$([ "$LIMIT_DETECTED" == "true" ] && echo "limited" || echo "ok")" \
+            --arg limit_name "${LIMIT_NAME:-}" \
+            --arg resets_at "$resets_iso" \
+            '{ status: $status, limit_name: $limit_name, resets_at: $resets_at }'
+    fi
+}
+
+# ============================================
+# Test Mode
+# ============================================
+
+run_test_mode() {
+    local wait_secs="$1"
+    LIMIT_DETECTED=true
+    LIMIT_NAME="test"
+    RESET_TIMESTAMP=$(( $(date +%s) + wait_secs ))
+
+    if [[ "$MODE" == "detailed" ]]; then
+        FIVE_HOUR_PCT=100
+        if $IS_GNU_DATE; then
+            FIVE_HOUR_RESETS=$(date -u -d "@$RESET_TIMESTAMP" +"%Y-%m-%dT%H:%M:%SZ")
+        else
+            FIVE_HOUR_RESETS=$(date -u -r "$RESET_TIMESTAMP" +"%Y-%m-%dT%H:%M:%SZ")
+        fi
+        SEVEN_DAY_PCT=45
+        SEVEN_DAY_RESETS=""
+        OPUS_PCT=72
+        OPUS_RESETS=""
+        SONNET_PCT=18
+        SONNET_RESETS=""
+    fi
+
+    warn "TEST MODE: Simulating rate limit (${wait_secs}s wait)"
+}
+
+# ============================================
+# Compact Mode (single-line status bar)
+# ============================================
+
+render_compact() {
+    local now_ts
+    now_ts=$(date +%s)
+    local line=""
+
+    if [[ "$MODE" == "detailed" && -n "${FIVE_HOUR_PCT:-}" ]]; then
+        # Detailed compact: show all dimensions inline
+        local mini_bar
+        mini_bar() {
+            local pct="$1" name="$2" w=8
+            (( pct > 100 )) && pct=100
+            local filled=$(( pct * w / 100 ))
+            local empty=$(( w - filled ))
+            local bar=""
+            local i
+            for (( i=0; i<filled; i++ )); do bar+="█"; done
+            for (( i=0; i<empty; i++ )); do bar+="░"; done
+            local color
+            color=$(color_for_pct "$pct")
+            printf "%s %b%s%b %d%%" "$name" "$color" "$bar" "$C_RESET" "$pct"
+        }
+
+        line+=" $(mini_bar "${FIVE_HOUR_PCT:-0}" "5h")"
+        [[ "${SEVEN_DAY_PCT:-0}" != "0" ]] && line+="  $(mini_bar "${SEVEN_DAY_PCT:-0}" "7d")"
+        [[ "${OPUS_PCT:-0}" != "0" ]] && line+="  $(mini_bar "${OPUS_PCT:-0}" "Op")"
+        [[ "${SONNET_PCT:-0}" != "0" ]] && line+="  $(mini_bar "${SONNET_PCT:-0}" "So")"
+    fi
+
+    # Status + countdown
+    if [[ "$LIMIT_DETECTED" == "true" && -n "$RESET_TIMESTAMP" ]]; then
+        local remaining=$(( RESET_TIMESTAMP - now_ts ))
+        (( remaining < 0 )) && remaining=0
+        local dur
+        dur=$(format_duration "$remaining")
+        if [[ -n "$line" ]]; then
+            line+="  ${C_RED}LIMITED${C_RESET} ${C_CYAN}${dur}${C_RESET}"
+        else
+            line+=" ${C_RED}RATE LIMITED${C_RESET}  resets in ${C_CYAN}${dur}${C_RESET}"
+        fi
+    else
+        if [[ -n "$line" ]]; then
+            line+="  ${C_GREEN}OK${C_RESET}"
+        else
+            line+=" ${C_GREEN}ALL CLEAR${C_RESET}"
+        fi
+    fi
+
+    local ts
+    ts=$(date "+%H:%M:%S")
+    printf "\r${C_DIM}[%s]${C_RESET}%s  " "$ts" "$line"
+}
+
+compact_loop() {
+    local last_check=0
+    local check_interval="${REFRESH_INTERVAL}"
+
+    # In basic mode, check less frequently (CLI call is expensive)
+    [[ "$MODE" == "basic" ]] && check_interval=300
+
+    printf "\033[?25l"  # Hide cursor
+
+    while true; do
+        local now_ts
+        now_ts=$(date +%s)
+        local since_check=$(( now_ts - last_check ))
+
+        if (( since_check >= check_interval )) || (( last_check == 0 )); then
+            if [[ -n "$TEST_MODE_SECS" ]]; then
+                run_test_mode "$TEST_MODE_SECS"
+                TEST_MODE_SECS=""
+                last_check=$now_ts
+            elif [[ "$MODE" == "detailed" && -n "$SESSION_KEY" ]]; then
+                check_detailed 2>/dev/null || true
+                last_check=$now_ts
+            elif [[ "$MODE" == "basic" ]]; then
+                check_basic 2>/dev/null || true
+                last_check=$now_ts
+            fi
+        fi
+
+        render_compact
+        sleep 1
+    done
+}
+
+# ============================================
+# tmux Launch
+# ============================================
+
+launch_tmux() {
+    command -v tmux &>/dev/null || die "--launch requires tmux. Install: brew install tmux"
+
+    local session_name="mycc"
+    # Always pass -d if user requested it; the compact process loads its own config
+    local sentinel_cmd="$0 --compact"
+    [[ "$LAUNCH_DETAILED" == "true" ]] && sentinel_cmd="$0 -d --compact"
+
+    # Kill existing session if present
+    tmux kill-session -t "$session_name" 2>/dev/null || true
+
+    # Build claude command
+    local claude_cmd="claude"
+    if [[ -n "$LAUNCH_ARGS" ]]; then
+        claude_cmd="claude $LAUNCH_ARGS"
+    fi
+
+    # Create session with Claude Code on top
+    tmux new-session -d -s "$session_name" -x "$(tput cols)" -y "$(tput lines)" "$claude_cmd"
+
+    # Split: bottom pane (3 lines) for sentinel
+    tmux split-window -v -t "$session_name" -l 2 "$sentinel_cmd"
+
+    # Focus on Claude Code pane (top)
+    tmux select-pane -t "$session_name":0.0
+
+    # Attach
+    tmux attach-session -t "$session_name"
+}
+
+# ============================================
+# Signal Handling
+# ============================================
+
+cleanup() {
+    printf "\033[?25h" 2>/dev/null  # Show cursor
+    echo ""
+    info "MyCC stopped."
+}
+
+trap cleanup EXIT
+trap 'echo ""; info "Interrupted."; exit 130' INT TERM
+
+# ============================================
+# Main
+# ============================================
+
+main() {
+    detect_os
+    load_config
+    parse_args "$@"
+
+    # Disable colors if requested or piped
+    if [[ "$NO_COLOR" == "true" ]] || [[ ! -t 1 ]]; then
+        C_RESET="" C_RED="" C_GREEN="" C_YELLOW="" C_BLUE=""
+        C_MAGENTA="" C_CYAN="" C_BOLD="" C_DIM=""
+    fi
+
+    # Capture mode before validation (for --launch to pass through)
+    [[ "$MODE" == "detailed" ]] && LAUNCH_DETAILED=true
+
+    # Validate mode requirements
+    if [[ "$MODE" == "detailed" && -z "$TEST_MODE_SECS" ]]; then
+        if [[ -z "$SESSION_KEY" ]]; then
+            warn "No sessionKey configured. Falling back to basic mode."
+            warn "Run 'mycc --setup' to configure detailed mode."
+            MODE="basic"
+        else
+            command -v jq &>/dev/null || die "Detailed mode requires jq. Install: brew install jq"
+            command -v curl &>/dev/null || die "Detailed mode requires curl."
+        fi
+    fi
+
+    if [[ "$MODE" == "basic" && -z "$TEST_MODE_SECS" && "$LAUNCH" != "true" ]]; then
+        command -v claude &>/dev/null || die "Basic mode requires claude CLI in PATH."
+    fi
+
+    # Handle --launch: create tmux session and exit
+    if [[ "$LAUNCH" == "true" ]]; then
+        launch_tmux
+        trap - EXIT; exit 0
+    fi
+
+    # Handle --compact: enter compact status bar loop
+    if [[ "$COMPACT" == "true" ]]; then
+        compact_loop
+        trap - EXIT; exit 0
+    fi
+
+    # Main loop
+    while true; do
+        # Check status
+        if [[ -n "$TEST_MODE_SECS" ]]; then
+            run_test_mode "$TEST_MODE_SECS"
+            TEST_MODE_SECS=""  # Only apply once; after resume, do real check
+        elif [[ "$MODE" == "detailed" ]]; then
+            check_detailed
+        else
+            check_basic
+        fi
+
+        # Output
+        if [[ "$OUTPUT_JSON" == "true" ]]; then
+            output_json
+            trap - EXIT; exit 0
+        fi
+
+        render_status
+
+        if [[ "$CHECK_ONLY" == "true" ]]; then
+            trap - EXIT; exit 0
+        fi
+
+        if [[ "$LIMIT_DETECTED" == "true" && -n "$RESET_TIMESTAMP" ]]; then
+            countdown_loop "$RESET_TIMESTAMP"
+
+            if [[ "$AUTO_RESUME" == "true" ]]; then
+                resume_claude
+            else
+                info "Limit has been lifted."
+            fi
+        else
+            if [[ "$WATCH_MODE" != "true" ]]; then
+                info "No rate limit detected. All clear."
+            fi
+        fi
+
+        # Loop or exit
+        if [[ "$WATCH_MODE" != "true" ]]; then
+            break
+        fi
+
+        info "Watching... next check in ${REFRESH_INTERVAL}s"
+        sleep "${REFRESH_INTERVAL}"
+    done
+}
+
+main "$@"
