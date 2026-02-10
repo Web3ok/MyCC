@@ -152,7 +152,8 @@ load_config() {
             val=$(echo "$val" | sed 's/^["'"'"']//; s/["'"'"']$//')
             case "$key" in
                 SESSION_KEY)       [[ -z "$SESSION_KEY" ]] && SESSION_KEY="$val" ;;
-                CF_CLEARANCE)      [[ -z "${CF_CLEARANCE:-}" ]] && CF_CLEARANCE="$val" ;;
+                COOKIE_HEADER)     [[ -z "${COOKIE_HEADER:-}" ]] && COOKIE_HEADER="$val" ;;
+                USER_AGENT)        [[ -z "${USER_AGENT:-}" ]] && USER_AGENT="$val" ;;
                 ORG_ID)            [[ -z "$ORG_ID" ]] && ORG_ID="$val" ;;
                 RESUME_MODE)       RESUME_MODE="$val" ;;
                 RESUME_PROMPT)     RESUME_PROMPT="$val" ;;
@@ -328,16 +329,19 @@ parse_reset_time_from_msg() {
 
 api_curl() {
     local url="$1"
-    local cookie_str="sessionKey=${SESSION_KEY}"
-    [[ -n "${CF_CLEARANCE:-}" ]] && cookie_str+="; cf_clearance=${CF_CLEARANCE}"
+    # If full cookie header is available, use it; otherwise build from individual values
+    local cookie_str="${COOKIE_HEADER:-}"
+    if [[ -z "$cookie_str" ]]; then
+        cookie_str="sessionKey=${SESSION_KEY}"
+        [[ -n "${CF_CLEARANCE:-}" ]] && cookie_str+="; cf_clearance=${CF_CLEARANCE}"
+    fi
+    # Use user's actual User-Agent if captured, otherwise default
+    local ua="${USER_AGENT:-Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36}"
     curl -s -w "\n%{http_code}" \
         --max-time 15 \
         -H "accept: */*" \
         -H "content-type: application/json" \
-        -H "user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36" \
-        -H "sec-ch-ua: \"Chromium\";v=\"132\", \"Google Chrome\";v=\"132\", \"Not-A.Brand\";v=\"99\"" \
-        -H "sec-ch-ua-mobile: ?0" \
-        -H "sec-ch-ua-platform: \"macOS\"" \
+        -H "user-agent: ${ua}" \
         -H "origin: https://claude.ai" \
         -H "referer: https://claude.ai/settings/usage" \
         -H "sec-fetch-dest: empty" \
@@ -659,23 +663,64 @@ setup_wizard() {
     echo -e "${C_BOLD}MyCC Setup${C_RESET}"
     echo "====================="
     echo ""
-    echo "To use detailed mode, you need cookies from your Claude.ai browser session."
+    echo "To use detailed mode, you need to copy request headers from your browser."
     echo ""
-    echo "Steps to get them:"
-    echo "  1. Open https://claude.ai in your browser, make sure you're logged in"
-    echo "  2. Open DevTools (Cmd+Option+I) > Application tab"
-    echo "  3. Under Cookies > https://claude.ai, copy these two values:"
-    echo "     - sessionKey"
-    echo "     - cf_clearance  (needed to bypass Cloudflare)"
+    echo "Steps:"
+    echo "  1. Open https://claude.ai/settings/usage in your browser (must be logged in)"
+    echo "  2. Open DevTools: Cmd+Option+I (Mac) / F12 (Windows)"
+    echo "  3. Go to the Network tab, filter by 'usage'"
+    echo "  4. Refresh the page — find the 'usage' request"
+    echo "  5. Right-click the request > Copy > Copy as cURL"
+    echo "  6. Paste below (we'll extract Cookie and User-Agent)"
     echo ""
+    echo "Paste the cURL command (then press Enter twice when done):"
 
-    local sk
-    read -rp "sessionKey (or press Enter to skip): " sk
-    SESSION_KEY="${sk:-}"
+    local curl_cmd=""
+    local line
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && break
+        curl_cmd+="$line "
+    done
 
-    local cfc
-    read -rp "cf_clearance (or press Enter to skip): " cfc
-    CF_CLEARANCE="${cfc:-}"
+    if [[ -n "$curl_cmd" ]]; then
+        # Extract Cookie header
+        local extracted_cookie
+        extracted_cookie=$(echo "$curl_cmd" | grep -oE "Cookie: [^'\"]*" | head -1 | sed 's/^Cookie: //')
+        if [[ -z "$extracted_cookie" ]]; then
+            extracted_cookie=$(echo "$curl_cmd" | grep -oE "'Cookie: [^']*'" | head -1 | sed "s/^'Cookie: //; s/'$//")
+        fi
+        # Extract User-Agent header
+        local extracted_ua
+        extracted_ua=$(echo "$curl_cmd" | grep -oE "user-agent: [^'\"]*" | head -1 | sed 's/^user-agent: //')
+        if [[ -z "$extracted_ua" ]]; then
+            extracted_ua=$(echo "$curl_cmd" | grep -ioE "'user-agent: [^']*'" | head -1 | sed "s/^'[Uu]ser-[Aa]gent: //; s/'$//")
+        fi
+
+        if [[ -n "$extracted_cookie" ]]; then
+            COOKIE_HEADER="$extracted_cookie"
+            # Also extract sessionKey from the cookie string for config
+            SESSION_KEY=$(echo "$extracted_cookie" | grep -oE 'sessionKey=[^;]+' | head -1 | sed 's/sessionKey=//')
+            info "Extracted cookies (${#extracted_cookie} chars)"
+        else
+            warn "Could not extract Cookie header from pasted cURL."
+            echo ""
+            echo "Fallback: paste your sessionKey manually."
+            local sk
+            read -rp "sessionKey (or press Enter to skip): " sk
+            SESSION_KEY="${sk:-}"
+        fi
+
+        if [[ -n "$extracted_ua" ]]; then
+            USER_AGENT="$extracted_ua"
+            info "Extracted User-Agent"
+        fi
+    else
+        echo ""
+        echo "No cURL pasted. Fallback: paste your sessionKey manually."
+        local sk
+        read -rp "sessionKey (or press Enter to skip): " sk
+        SESSION_KEY="${sk:-}"
+    fi
 
     if [[ -n "$SESSION_KEY" ]]; then
         detect_os
@@ -696,18 +741,19 @@ setup_wizard() {
     REFRESH_INTERVAL="${ri:-120}"
 
     # Write config
-    cat > "$CONF_FILE" <<EOF
+    cat > "$CONF_FILE" <<CONFEOF
 # mycc configuration
 # Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 SESSION_KEY=${SESSION_KEY}
-CF_CLEARANCE=${CF_CLEARANCE}
+COOKIE_HEADER=${COOKIE_HEADER:-}
+USER_AGENT=${USER_AGENT:-}
 ORG_ID=${ORG_ID}
 RESUME_MODE=${RESUME_MODE}
 RESUME_PROMPT=${RESUME_PROMPT}
 REFRESH_INTERVAL=${REFRESH_INTERVAL}
 NOTIFY=true
-EOF
+CONFEOF
 
     chmod 600 "$CONF_FILE"
     echo ""
