@@ -2,20 +2,7 @@
 
 Quota monitor + countdown + auto-resume for Claude Code. One script, zero hassle.
 
-```
-  ┌────────────────────────────────────────────────────┐
-  │  MyCC v1.0.0                                       │
-  ├────────────────────────────────────────────────────┤
-  │  5-Hour  [████████████████░░░░]  82%  Feb 10 3PM   │
-  │  7-Day   [██████░░░░░░░░░░░░░░]  31%  Feb 14      │
-  │  Opus    [████████████████████] 100%  Feb 12       │
-  │  Sonnet  [████░░░░░░░░░░░░░░░░]  22%  Feb 15      │
-  │                                                    │
-  │  Status: RATE LIMITED (Opus 7-day)                 │
-  │  Resets in 01:18:22                                │
-  │  Action: Auto-resume (continue)                    │
-  └────────────────────────────────────────────────────┘
-```
+![MyCC Detailed Mode](screenshots/mycc-detailed.png)
 
 [English](#features) | [中文](README_zh.md)
 
@@ -71,17 +58,7 @@ mycc --launch "-c"
 
 This opens a tmux split — Claude Code on top, MyCC status bar on bottom:
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                                                                 │
-│  Claude Code (interactive session)                              │
-│                                                                 │
-│  > Working on your code...                                      │
-│                                                                 │
-├─────────────────────────────────────────────────────────────────┤
-│ [17:01:10] 5h ████████ 100%  7d ███░░░░░ 45%  LIMITED 02:14:32 │
-└─────────────────────────────────────────────────────────────────┘
-```
+![MyCC Launch Mode](screenshots/mycc-launch.png)
 
 ### Manual usage
 
@@ -104,16 +81,7 @@ Detects rate limits via the `claude` CLI. Zero configuration needed.
 mycc --check
 ```
 
-```
-  ┌────────────────────────────────────────────────────┐
-  │  MyCC v1.0.0                                       │
-  ├────────────────────────────────────────────────────┤
-  │  Status:  RATE LIMITED                             │
-  │  Limit:   5-hour limit reached                     │
-  │  Resets:  2026-02-10 15:00 (in 02:14:32)           │
-  │  Action:  Auto-resume (continue)                   │
-  └────────────────────────────────────────────────────┘
-```
+![MyCC Basic Mode](screenshots/mycc-basic.png)
 
 ### Detailed Mode (`-d`)
 
@@ -123,19 +91,7 @@ Calls the claude.ai API for precise utilization percentages across all dimension
 mycc -d --check
 ```
 
-```
-  ┌────────────────────────────────────────────────────┐
-  │  MyCC v1.0.0                                       │
-  ├────────────────────────────────────────────────────┤
-  │  5-Hour  [████████████████░░░░]  82%  Feb 10 3PM   │
-  │  7-Day   [██████░░░░░░░░░░░░░░]  31%  Feb 14      │
-  │  Opus    [████████████████████] 100%  Feb 12       │
-  │  Sonnet  [████░░░░░░░░░░░░░░░░]  22%  Feb 15      │
-  │                                                    │
-  │  Status: RATE LIMITED (Opus 7-day)                 │
-  │  Resets in 01:18:22                                │
-  └────────────────────────────────────────────────────┘
-```
+![MyCC Detailed Mode](screenshots/mycc-detailed.png)
 
 Requires a one-time setup:
 
